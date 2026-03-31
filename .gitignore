@@ -1,0 +1,37 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量（含密钥，禁止提交）
+.env
+
+# 上传的文档
+uploads/
+
+# 日志
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# BM25 训练模型（二进制大文件）
+*.pkl
+
+# Docker 数据卷
+milvus_data/
+postgres_data/
+redis_data/
+etcd_data/
+minio_data/
+=3.9.1

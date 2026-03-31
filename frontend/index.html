@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MedQA – 中文医疗问答</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    /* ── 重置与基础样式 ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117; --sidebar-bg: #161b22; --card: #1c2128;
+      --border: #30363d; --primary: #2979ff; --primary-hover: #4d94ff;
+      --text: #e6edf3; --text-muted: #8b949e; --text-dim: #484f58;
+      --success: #3fb950; --warn: #d29922; --error: #f85149;
+      --rerank-high: #3fb950; --rerank-mid: #d29922; --rerank-low: #f85149;
+      --radius: 8px; --sidebar-w: 260px;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; }
+    button { cursor: pointer; border: none; outline: none; }
+    input, textarea { outline: none; }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── 整体布局 ───────────────────────────────────────────────────── */
+    #app { display: flex; height: 100vh; }
+    .sidebar { width: var(--sidebar-w); background: var(--sidebar-bg); border-right: 1px solid var(--border);
+               display: flex; flex-direction: column; flex-shrink: 0; }
+    .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+    /* ── 登录/注册蒙层 ──────────────────────────────────────────────── */
+    .auth-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex;
+                    align-items: center; justify-content: center; z-index: 100; }
+    .auth-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+                 padding: 36px 32px; width: 380px; max-width: 96vw; }
+    .auth-card h2 { font-size: 1.4rem; margin-bottom: 6px; }
+    .auth-card .subtitle { color: var(--text-muted); font-size: .9rem; margin-bottom: 24px; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: .85rem; color: var(--text-muted); margin-bottom: 6px; }
+    .form-group input { width: 100%; background: var(--bg); border: 1px solid var(--border);
+                        border-radius: var(--radius); padding: 10px 14px; color: var(--text); font-size: .95rem; }
+    .form-group input:focus { border-color: var(--primary); }
+    .btn { width: 100%; padding: 11px; border-radius: var(--radius); font-size: .95rem;
+           font-weight: 600; transition: background .2s; }
+    .btn-primary { background: var(--primary); color: #fff; }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .auth-toggle { margin-top: 16px; text-align: center; font-size: .85rem; color: var(--text-muted); }
+    .auth-toggle a { color: var(--primary); cursor: pointer; text-decoration: none; }
+    .error-msg { color: var(--error); font-size: .85rem; margin-top: 10px; text-align: center; }
+
+    /* ── 侧边栏头部 ─────────────────────────────────────────────────── */
+    .sidebar-header { padding: 18px 16px; border-bottom: 1px solid var(--border); display: flex;
+                      align-items: center; gap: 10px; }
+    .logo { font-size: 1.1rem; font-weight: 700; color: var(--primary); }
+    .logo span { color: var(--text); }
+    .sidebar-header .user-chip { margin-left: auto; background: var(--card);
+                                  border: 1px solid var(--border); border-radius: 20px;
+                                  padding: 4px 12px; font-size: .8rem; color: var(--text-muted); }
+    .btn-icon { background: transparent; color: var(--text-muted); padding: 4px 8px;
+                border-radius: var(--radius); font-size: .8rem; }
+    .btn-icon:hover { background: var(--card); color: var(--text); }
+
+    /* ── 新建对话按钮 ───────────────────────────────────────────────── */
+    .new-chat-btn { margin: 12px; padding: 10px; border-radius: var(--radius);
+                    background: var(--primary); color: #fff; font-size: .9rem;
+                    font-weight: 600; text-align: center; }
+    .new-chat-btn:hover { background: var(--primary-hover); }
+
+    /* ── 会话列表 ───────────────────────────────────────────────────── */
+    .session-list { flex: 1; overflow-y: auto; padding: 4px 8px; }
+    .session-item { padding: 10px 12px; border-radius: var(--radius); cursor: pointer;
+                    display: flex; align-items: center; gap: 8px; margin-bottom: 2px;
+                    transition: background .15s; }
+    .session-item:hover { background: var(--card); }
+    .session-item.active { background: var(--card); border-left: 2px solid var(--primary); }
+    .session-title { flex: 1; font-size: .875rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-delete { opacity: 0; color: var(--error); transition: opacity .15s; background: transparent; }
+    .session-item:hover .session-delete { opacity: 1; }
+
+    /* ── 文档面板 ───────────────────────────────────────────────────── */
+    .doc-panel { border-top: 1px solid var(--border); padding: 12px; }
+    .doc-panel-title { font-size: .8rem; color: var(--text-muted); text-transform: uppercase;
+                       letter-spacing: .05em; margin-bottom: 8px; }
+    .doc-list { max-height: 160px; overflow-y: auto; }
+    .doc-item { display: flex; align-items: center; gap: 6px; padding: 5px 4px;
+                border-radius: 4px; font-size: .82rem; }
+    .doc-item:hover { background: var(--card); }
+    .doc-status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+    .doc-status-dot.ready { background: var(--success); }
+    .doc-status-dot.processing { background: var(--warn); animation: pulse 1.2s infinite; }
+    .doc-status-dot.error { background: var(--error); }
+    .doc-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .doc-delete { opacity: 0; color: var(--error); background: transparent; font-size: .75rem; }
+    .doc-item:hover .doc-delete { opacity: 1; }
+    .upload-btn { width: 100%; margin-top: 8px; padding: 8px; border-radius: var(--radius);
+                  background: transparent; border: 1px dashed var(--border); color: var(--text-muted);
+                  font-size: .85rem; transition: all .2s; }
+    .upload-btn:hover { border-color: var(--primary); color: var(--primary); }
+    #file-input { display: none; }
+
+    /* ── 聊天区域 ───────────────────────────────────────────────────── */
+    .chat-header { padding: 14px 20px; border-bottom: 1px solid var(--border);
+                   display: flex; align-items: center; gap: 12px; font-size: .95rem; font-weight: 600; }
+    .chat-header .settings-row { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+    .toggle-label { font-size: .8rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; }
+    .toggle { width: 36px; height: 20px; background: var(--border); border-radius: 10px;
+              position: relative; cursor: pointer; transition: background .2s; }
+    .toggle.on { background: var(--primary); }
+    .toggle::after { content: ''; position: absolute; width: 14px; height: 14px; border-radius: 50%;
+                     background: #fff; top: 3px; left: 3px; transition: left .2s; }
+    .toggle.on::after { left: 19px; }
+    .logout-btn { background: transparent; color: var(--text-muted); font-size: .8rem; padding: 5px 10px;
+                  border: 1px solid var(--border); border-radius: var(--radius); }
+    .logout-btn:hover { color: var(--error); border-color: var(--error); }
+
+    .messages-wrap { flex: 1; overflow-y: auto; padding: 24px 20px; display: flex; flex-direction: column; gap: 20px; }
+
+    /* ── 消息气泡 ───────────────────────────────────────────────────── */
+    .msg { display: flex; flex-direction: column; gap: 6px; max-width: 820px; }
+    .msg.user { align-self: flex-end; align-items: flex-end; }
+    .msg.assistant { align-self: flex-start; align-items: flex-start; }
+    .msg-bubble { padding: 12px 16px; border-radius: 12px; font-size: .95rem; line-height: 1.65;
+                  white-space: pre-wrap; word-break: break-word; }
+    .msg.user .msg-bubble { background: var(--primary); color: #fff; border-bottom-right-radius: 4px; }
+    .msg.assistant .msg-bubble { background: var(--card); border: 1px solid var(--border);
+                                  border-bottom-left-radius: 4px; min-width: 200px; }
+    .msg-bubble.streaming::after { content: '▋'; animation: blink .8s step-end infinite; }
+
+    /* ── 思考链路/步骤追踪 ──────────────────────────────────────────── */
+    .thinking-box { background: var(--sidebar-bg); border: 1px solid var(--border); border-radius: var(--radius);
+                    padding: 10px 14px; font-size: .82rem; color: var(--text-muted); max-width: 600px; }
+    .thinking-box .step-item { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+    .step-icon { font-size: 1rem; }
+    .step-label { font-weight: 500; color: var(--text); }
+    .step-detail { color: var(--text-muted); margin-left: 26px; font-size: .78rem; }
+
+    /* ── 来源面板 ───────────────────────────────────────────────────── */
+    .sources-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer;
+                      font-size: .8rem; color: var(--text-muted); user-select: none; }
+    .sources-toggle:hover { color: var(--text); }
+    .sources-panel { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+    .source-card { background: var(--sidebar-bg); border: 1px solid var(--border);
+                   border-radius: var(--radius); padding: 10px 14px; font-size: .82rem; }
+    .source-card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+    .source-badge { padding: 2px 8px; border-radius: 12px; font-size: .75rem; font-weight: 600; }
+    .source-badge.l1 { background: #1a3a5c; color: #79c0ff; }
+    .source-badge.l2 { background: #1a3a1a; color: #3fb950; }
+    .source-badge.l3 { background: #3a2a1a; color: #ffa657; }
+    .score-bar-wrap { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 120px; }
+    .score-bar { height: 6px; border-radius: 3px; flex: 1; background: var(--border); overflow: hidden; }
+    .score-fill { height: 100%; border-radius: 3px; transition: width .4s; }
+    .score-label { font-size: .75rem; min-width: 38px; text-align: right; }
+    .source-text { color: var(--text-muted); line-height: 1.55; overflow: hidden; display: -webkit-box;
+                   -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+    .source-filename { font-size: .75rem; color: var(--text-dim); margin-top: 4px; }
+
+    /* ── 输入区域 ───────────────────────────────────────────────────── */
+    .input-area { padding: 16px 20px; border-top: 1px solid var(--border); }
+    .input-row { display: flex; gap: 10px; align-items: flex-end;
+                 background: var(--card); border: 1px solid var(--border);
+                 border-radius: 12px; padding: 10px 14px; transition: border-color .2s; }
+    .input-row:focus-within { border-color: var(--primary); }
+    .input-row textarea { flex: 1; background: transparent; border: none; color: var(--text);
+                          font-size: .95rem; resize: none; min-height: 24px; max-height: 120px;
+                          font-family: inherit; line-height: 1.5; }
+    .send-btn { padding: 8px 18px; border-radius: var(--radius); background: var(--primary);
+                color: #fff; font-weight: 600; font-size: .9rem; transition: background .2s; }
+    .send-btn:hover:not(:disabled) { background: var(--primary-hover); }
+    .send-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .stop-btn { padding: 8px 14px; border-radius: var(--radius); background: var(--error);
+                color: #fff; font-weight: 600; font-size: .85rem; }
+    .input-hint { font-size: .78rem; color: var(--text-dim); margin-top: 6px; }
+
+    /* ── 空状态占位 ─────────────────────────────────────────────────── */
+    .empty-state { flex: 1; display: flex; flex-direction: column; align-items: center;
+                   justify-content: center; gap: 12px; color: var(--text-muted); }
+    .empty-state .logo-big { font-size: 2.5rem; font-weight: 800; color: var(--primary); }
+    .empty-state p { font-size: .95rem; }
+    .quick-q { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; max-width: 560px; }
+    .quick-q button { background: var(--card); border: 1px solid var(--border); color: var(--text);
+                      padding: 8px 14px; border-radius: 20px; font-size: .85rem; transition: all .2s; }
+    .quick-q button:hover { border-color: var(--primary); color: var(--primary); }
+
+    /* ── 动画 ───────────────────────────────────────────────────────── */
+    @keyframes blink { 50% { opacity: 0; } }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    .msg { animation: fadeIn .2s ease; }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── 登录/注册蒙层 ──────────────────────────────────────────────── -->
+  <div class="auth-overlay" v-if="!token">
+    <div class="auth-card">
+      <h2>{{ authMode === 'login' ? '欢迎回来' : '创建账号' }}</h2>
+      <p class="subtitle">MedQA 中文医疗智能问答</p>
+      <form @submit.prevent="doAuth">
+        <div class="form-group" v-if="authMode === 'register'">
+          <label>用户名</label>
+          <input v-model="authForm.username" placeholder="3-64位字母数字下划线" required />
+        </div>
+        <div class="form-group" v-if="authMode === 'login'">
+          <label>用户名</label>
+          <input v-model="authForm.username" placeholder="用户名" required />
+        </div>
+        <div class="form-group" v-if="authMode === 'register'">
+          <label>邮箱</label>
+          <input type="email" v-model="authForm.email" placeholder="your@email.com" required />
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" v-model="authForm.password" placeholder="至少8位" required />
+        </div>
+        <p class="error-msg" v-if="authError">{{ authError }}</p>
+        <button class="btn btn-primary" type="submit" :disabled="authLoading">
+          {{ authLoading ? '处理中…' : (authMode === 'login' ? '登录' : '注册') }}
+        </button>
+      </form>
+      <div class="auth-toggle">
+        {{ authMode === 'login' ? '还没有账号？' : '已有账号？' }}
+        <a @click="authMode = authMode === 'login' ? 'register' : 'login'; authError = ''">
+          {{ authMode === 'login' ? '立即注册' : '去登录' }}
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 侧边栏 ──────────────────────────────────────────────────────── -->
+  <aside class="sidebar" v-if="token">
+    <div class="sidebar-header">
+      <span class="logo">Med<span>QA</span></span>
+      <span class="user-chip">{{ user?.username }}</span>
+    </div>
+
+    <button class="new-chat-btn" @click="createSession">＋ 新对话</button>
+
+    <div class="session-list">
+      <div
+        v-for="s in sessions" :key="s.id"
+        class="session-item" :class="{active: s.id === activeSessionId}"
+        @click="selectSession(s.id)"
+      >
+        <span class="session-title">{{ s.title || '新对话' }}</span>
+        <button class="session-delete" @click.stop="deleteSession(s.id)">✕</button>
+      </div>
+    </div>
+
+    <!-- 文档面板 -->
+    <div class="doc-panel">
+      <div class="doc-panel-title">知识库文档</div>
+      <div class="doc-list">
+        <div class="doc-item" v-for="d in documents" :key="d.id">
+          <span class="doc-status-dot" :class="d.status"></span>
+          <span class="doc-name" :title="d.filename">{{ d.filename }}</span>
+          <button class="doc-delete" @click="deleteDoc(d.id)">✕</button>
+        </div>
+        <div style="color:var(--text-dim);font-size:.8rem;padding:4px" v-if="!documents.length">暂无文档</div>
+      </div>
+      <input type="file" id="file-input" ref="fileInput" accept=".pdf,.txt,.md" @change="uploadFile" />
+      <button class="upload-btn" @click="$refs.fileInput.click()" :disabled="uploading">
+        {{ uploading ? '上传中…' : '＋ 上传文档 (PDF/TXT/MD)' }}
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── 主内容区 ────────────────────────────────────────────────────── -->
+  <div class="main" v-if="token">
+
+    <!-- 头部工具栏 -->
+    <div class="chat-header">
+      <span>{{ activeSession?.title || '选择或创建对话' }}</span>
+      <div class="settings-row">
+        <label class="toggle-label">
+          混合检索
+          <div class="toggle" :class="{on: settings.use_hybrid}" @click="settings.use_hybrid = !settings.use_hybrid"></div>
+        </label>
+        <label class="toggle-label">
+          Rerank
+          <div class="toggle" :class="{on: settings.use_rerank}" @click="settings.use_rerank = !settings.use_rerank"></div>
+        </label>
+        <button class="logout-btn" @click="logout">退出</button>
+      </div>
+    </div>
+
+    <!-- 消息列表区域 -->
+    <div class="messages-wrap" ref="messagesWrap">
+
+      <!-- 空状态 -->
+      <div class="empty-state" v-if="!activeSession || !messages.length">
+        <div class="logo-big">MedQA</div>
+        <p>中文医疗智能问答助手</p>
+        <div class="quick-q">
+          <button v-for="q in quickQuestions" :key="q" @click="sendQuickQ(q)">{{ q }}</button>
+        </div>
+      </div>
+
+      <!-- 消息列表 -->
+      <template v-else>
+        <div
+          v-for="msg in messages"
+          :key="msg.id"
+          class="msg" :class="msg.role"
+        >
+          <!-- 思考链路（仅助手消息显示） -->
+          <div class="thinking-box" v-if="msg.role === 'assistant' && msg.steps && msg.steps.length">
+            <div class="step-item" v-for="(st, i) in msg.steps" :key="i">
+              <span class="step-icon">{{ stepIcon(st.step) }}</span>
+              <span class="step-label">{{ stepLabel(st.step) }}</span>
+            </div>
+          </div>
+
+          <!-- 消息气泡 -->
+          <div class="msg-bubble" :class="{streaming: msg.streaming}">{{ msg.content }}</div>
+
+          <!-- 参考来源 -->
+          <template v-if="msg.role === 'assistant' && msg.sources && msg.sources.length">
+            <div class="sources-toggle" @click="msg._showSources = !msg._showSources">
+              <span>{{ msg._showSources ? '▾' : '▸' }}</span>
+              <span>{{ msg.sources.length }} 个参考来源</span>
+              <span v-if="settings.use_rerank" style="color:var(--primary);font-size:.75rem">• 已精排</span>
+            </div>
+            <div class="sources-panel" v-if="msg._showSources">
+              <div class="source-card" v-for="(src, si) in msg.sources" :key="si">
+                <div class="source-card-header">
+                  <span class="source-badge" :class="'l' + src.level">L{{ src.level }}</span>
+                  <div class="score-bar-wrap" v-if="src.rerank_score != null">
+                    <div class="score-bar">
+                      <div class="score-fill"
+                           :style="{width: (src.rerank_score * 100) + '%', background: scoreColor(src.rerank_score)}">
+                      </div>
+                    </div>
+                    <span class="score-label" :style="{color: scoreColor(src.rerank_score)}">
+                      {{ (src.rerank_score * 100).toFixed(1) }}%
+                    </span>
+                  </div>
+                  <div class="score-bar-wrap" v-else-if="src.score != null">
+                    <div class="score-bar">
+                      <div class="score-fill"
+                           :style="{width: Math.min(src.score * 100, 100) + '%', background: '#2979ff'}">
+                      </div>
+                    </div>
+                    <span class="score-label" style="color:#2979ff">{{ src.score?.toFixed(3) }}</span>
+                  </div>
+                </div>
+                <div class="source-text">{{ src.text }}</div>
+                <div class="source-filename" v-if="src.metadata?.filename">📄 {{ src.metadata.filename }}</div>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- 实时流式消息 -->
+        <div class="msg assistant" v-if="streamingMsg">
+          <!-- 实时步骤追踪 -->
+          <div class="thinking-box" v-if="liveSteps.length">
+            <div class="step-item" v-for="(st, i) in liveSteps" :key="i">
+              <span class="step-icon">{{ stepIcon(st.step) }}</span>
+              <span class="step-label">{{ stepLabel(st.step) }}</span>
+            </div>
+          </div>
+          <div class="msg-bubble streaming">{{ streamingMsg }}</div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 输入区域 -->
+    <div class="input-area">
+      <div class="input-row">
+        <textarea
+          ref="queryInput"
+          v-model="query"
+          placeholder="输入医疗问题…"
+          rows="1"
+          @keydown.enter.exact.prevent="sendMessage"
+          @input="autoResize"
+        ></textarea>
+        <button class="stop-btn" v-if="streaming" @click="stopGeneration">■ 停止</button>
+        <button class="send-btn" v-else @click="sendMessage" :disabled="!query.trim() || !activeSessionId">发送</button>
+      </div>
+      <div class="input-hint">Enter 发送 · Shift+Enter 换行</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const { createApp, ref, computed, nextTick, onMounted, watch } = Vue;
+
+const API = '';  // 相对当前域名，留空即可
+
+createApp({
+  setup() {
+    // ── 认证 ──────────────────────────────────────────────────────
+    const token     = ref(localStorage.getItem('medqa_token') || '');
+    const user      = ref(JSON.parse(localStorage.getItem('medqa_user') || 'null'));
+    const authMode  = ref('login');
+    const authForm  = ref({ username: '', email: '', password: '' });
+    const authError = ref('');
+    const authLoading = ref(false);
+
+    async function doAuth() {
+      authError.value = '';
+      authLoading.value = true;
+      try {
+        const path = authMode.value === 'login' ? '/api/auth/login' : '/api/auth/register';
+        const body = authMode.value === 'login'
+          ? { username: authForm.value.username, password: authForm.value.password }
+          : { username: authForm.value.username, email: authForm.value.email, password: authForm.value.password };
+        const resp = await apiFetch(path, { method: 'POST', body: JSON.stringify(body) }, false);
+        token.value = resp.access_token;
+        user.value  = resp.user;
+        localStorage.setItem('medqa_token', resp.access_token);
+        localStorage.setItem('medqa_user', JSON.stringify(resp.user));
+        await loadSessions();
+        await loadDocuments();
+      } catch(e) {
+        authError.value = e.message || '认证失败';
+      } finally {
+        authLoading.value = false;
+      }
+    }
+
+    function logout() {
+      token.value = ''; user.value = null;
+      localStorage.removeItem('medqa_token');
+      localStorage.removeItem('medqa_user');
+      sessions.value = []; messages.value = [];
+      activeSessionId.value = null;
+    }
+
+    // ── 会话管理 ────────────────────────────────────────────────────
+    const sessions        = ref([]);
+    const activeSessionId = ref(null);
+    const activeSession   = computed(() => sessions.value.find(s => s.id === activeSessionId.value));
+
+    async function loadSessions() {
+      try {
+        const data = await apiFetch('/api/chat/sessions');
+        sessions.value = data;
+      } catch(e) { console.error(e); }
+    }
+
+    async function createSession() {
+      const s = await apiFetch('/api/chat/sessions', { method: 'POST', body: JSON.stringify({ title: '新对话' }) });
+      sessions.value.unshift(s);
+      selectSession(s.id);
+    }
+
+    async function selectSession(id) {
+      activeSessionId.value = id;
+      messages.value = [];
+      const data = await apiFetch(`/api/chat/sessions/${id}`);
+      messages.value = (data.messages || []).map(m => ({
+        ...m,
+        steps: m.msg_metadata?.steps || [],
+        sources: m.msg_metadata?.sources || [],
+        _showSources: false,
+      }));
+      nextTick(scrollToBottom);
+    }
+
+    async function deleteSession(id) {
+      await apiFetch(`/api/chat/sessions/${id}`, { method: 'DELETE' });
+      sessions.value = sessions.value.filter(s => s.id !== id);
+      if (activeSessionId.value === id) {
+        activeSessionId.value = null;
+        messages.value = [];
+      }
+    }
+
+    // ── 消息与流式输出 ──────────────────────────────────────────────
+    const messages      = ref([]);
+    const query         = ref('');
+    const streaming     = ref(false);
+    const streamingMsg  = ref('');
+    const liveSteps     = ref([]);
+    const messagesWrap  = ref(null);
+    const queryInput    = ref(null);
+    let abortController = null;
+
+    const settings = ref({ use_hybrid: true, use_rerank: true });
+
+    async function sendMessage() {
+      const q = query.value.trim();
+      if (!q || !activeSessionId.value || streaming.value) return;
+      query.value = '';
+      nextTick(() => autoResize());
+
+      messages.value.push({ id: Date.now() + '-user', role: 'user', content: q });
+      nextTick(scrollToBottom);
+
+      streaming.value  = true;
+      streamingMsg.value = '';
+      liveSteps.value  = [];
+
+      const params = new URLSearchParams({
+        query: q,
+        top_k: 5,
+        candidate_k: 20,
+        use_rerank: settings.value.use_rerank,
+        use_hybrid: settings.value.use_hybrid,
+      });
+
+      abortController = new AbortController();
+
+      try {
+        const resp = await fetch(
+          `${API}/api/chat/sessions/${activeSessionId.value}/stream?${params}`,
+          {
+            headers: { Authorization: `Bearer ${token.value}` },
+            signal: abortController.signal,
+          }
+        );
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const ev = JSON.parse(line.slice(6));
+              handleSSE(ev);
+            } catch {}
+          }
+        }
+      } catch(e) {
+        if (e.name !== 'AbortError') {
+          messages.value.push({
+            id: Date.now() + '-err', role: 'assistant',
+            content: '⚠️ 请求失败：' + e.message, steps: [], sources: [], _showSources: false,
+          });
+        }
+      } finally {
+        // 将流式消息提交到历史记录
+        if (streamingMsg.value) {
+          messages.value.push({
+            id: Date.now() + '-ass', role: 'assistant',
+            content: streamingMsg.value,
+            steps: [...liveSteps.value],
+            sources: lastSources,
+            _showSources: false,
+          });
+          // 同步更新侧边栏会话标题
+          const idx = sessions.value.findIndex(s => s.id === activeSessionId.value);
+          if (idx >= 0 && sessions.value[idx].title === '新对话') {
+            sessions.value[idx].title = q.slice(0, 40);
+          }
+        }
+        streamingMsg.value = '';
+        liveSteps.value    = [];
+        streaming.value    = false;
+        abortController    = null;
+        nextTick(scrollToBottom);
+      }
+    }
+
+    let lastSources = [];
+
+    // 处理 SSE 事件
+    function handleSSE(ev) {
+      switch(ev.type) {
+        case 'token':
+          streamingMsg.value += (ev.content || '');
+          nextTick(scrollToBottom);
+          break;
+        case 'step':
+          // 去重连续相同步骤
+          const last = liveSteps.value[liveSteps.value.length - 1];
+          if (!last || last.step !== ev.step) {
+            liveSteps.value.push({ step: ev.step, data: ev.data || {} });
+          }
+          break;
+        case 'sources':
+          lastSources = ev.data || [];
+          break;
+        case 'error':
+          streamingMsg.value += '\n⚠️ ' + (ev.content || '未知错误');
+          break;
+        case 'done':
+          if (!streamingMsg.value && ev.data?.final_answer) {
+            streamingMsg.value = ev.data.final_answer;
+          }
+          break;
+      }
+    }
+
+    // 停止生成
+    function stopGeneration() {
+      if (abortController) abortController.abort();
+    }
+
+    // 发送快捷问题
+    function sendQuickQ(q) {
+      if (!activeSessionId.value) {
+        createSession().then(() => { query.value = q; sendMessage(); });
+      } else {
+        query.value = q; sendMessage();
+      }
+    }
+
+    // ── 文档管理 ────────────────────────────────────────────────────
+    const documents  = ref([]);
+    const uploading  = ref(false);
+    const fileInput  = ref(null);
+
+    async function loadDocuments() {
+      try { documents.value = await apiFetch('/api/documents'); }
+      catch(e) { console.error(e); }
+    }
+
+    async function uploadFile(evt) {
+      const file = evt.target.files[0];
+      if (!file) return;
+      uploading.value = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const doc = await apiFetch('/api/documents/', {
+          method: 'POST',
+          body: fd,
+          noContentType: true,
+        });
+        documents.value.unshift(doc);
+        pollDocStatus(doc.id);
+      } catch(e) {
+        alert('上传失败：' + e.message);
+      } finally {
+        uploading.value = false;
+        evt.target.value = '';
+      }
+    }
+
+    // 轮询文档处理状态
+    function pollDocStatus(docId) {
+      const timer = setInterval(async () => {
+        try {
+          const doc = await apiFetch(`/api/documents/${docId}`);
+          const idx = documents.value.findIndex(d => d.id === docId);
+          if (idx >= 0) documents.value[idx] = doc;
+          if (doc.status === 'ready' || doc.status === 'error') clearInterval(timer);
+        } catch { clearInterval(timer); }
+      }, 2000);
+    }
+
+    async function deleteDoc(id) {
+      await apiFetch(`/api/documents/${id}`, { method: 'DELETE' });
+      documents.value = documents.value.filter(d => d.id !== id);
+    }
+
+    // ── 工具函数 ────────────────────────────────────────────────────
+    // 通用 API 请求封装
+    async function apiFetch(path, opts = {}, withAuth = true) {
+      const headers = { 'Content-Type': 'application/json' };
+      if (opts.noContentType) delete headers['Content-Type'];
+      if (withAuth) headers['Authorization'] = `Bearer ${token.value}`;
+      const merged = { ...opts, headers: { ...(opts.headers || {}), ...headers } };
+      if (opts.noContentType) delete merged.headers['Content-Type'];
+
+      const resp = await fetch(API + path, merged);
+      if (resp.status === 204) return null;
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+      return data;
+    }
+
+    // 滚动到消息底部
+    function scrollToBottom() {
+      if (messagesWrap.value) {
+        messagesWrap.value.scrollTop = messagesWrap.value.scrollHeight;
+      }
+    }
+
+    // 自动调整文本框高度
+    function autoResize() {
+      const el = queryInput.value;
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+    }
+
+    // 根据分数返回颜色
+    function scoreColor(score) {
+      if (score == null) return '#8b949e';
+      if (score >= 0.7) return 'var(--rerank-high)';
+      if (score >= 0.4) return 'var(--rerank-mid)';
+      return 'var(--rerank-low)';
+    }
+
+    const STEP_META = {
+      Searching:     { icon: '🔍', label: '检索知识库' },
+      Merging:       { icon: '🔗', label: '合并上下文块' },
+      Reranking:     { icon: '⬆', label: 'Rerank 精排' },
+      Grading:       { icon: '📊', label: '相关性评分' },
+      Rewriting:     { icon: '✏️', label: '查询重写' },
+      HospitalLookup:{ icon: '🏥', label: '医院查询' },
+      NoResults:     { icon: '❌', label: '未找到相关文档' },
+      Done:          { icon: '✅', label: '检索完成' },
+    };
+    function stepIcon(step) { return STEP_META[step]?.icon || '⚙️'; }
+    function stepLabel(step) { return STEP_META[step]?.label || step; }
+
+    const quickQuestions = [
+      '高血压如何治疗？',
+      '2型糖尿病的饮食注意事项',
+      '心肌梗死的临床症状有哪些？',
+      '抗生素耐药性的原因和对策',
+    ];
+
+    onMounted(async () => {
+      if (token.value) {
+        await loadSessions();
+        await loadDocuments();
+      }
+    });
+
+    return {
+      token, user, authMode, authForm, authError, authLoading, doAuth, logout,
+      sessions, activeSessionId, activeSession, createSession, selectSession, deleteSession,
+      messages, query, streaming, streamingMsg, liveSteps, settings,
+      messagesWrap, queryInput, sendMessage, stopGeneration, sendQuickQ,
+      documents, uploading, fileInput, uploadFile, deleteDoc,
+      scoreColor, stepIcon, stepLabel, quickQuestions, autoResize,
+    };
+  }
+}).mount('#app');
+</script>
+</body>
+</html>
