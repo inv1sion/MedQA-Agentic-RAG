@@ -156,6 +156,7 @@ async def stream_chat(
                 query=query.strip(),
                 chat_history=chat_history[1:],  # exclude system
                 db=db,
+                session_id=session_id,
                 session_summary=session_summary,
                 top_k=top_k,
                 candidate_k=candidate_k,
@@ -247,6 +248,7 @@ async def post_message(
         query=payload.query,
         chat_history=chat_history[1:],
         db=db,
+        session_id=session_id,
         session_summary=session_summary,
         top_k=payload.top_k,
         candidate_k=payload.candidate_k,

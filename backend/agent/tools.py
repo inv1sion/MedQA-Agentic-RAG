@@ -28,6 +28,7 @@ from ..rag.grader import grade_documents, needs_rewrite
 from ..rag.query_rewriter import rewrite_query
 from ..rag.reranker import rerank
 from ..rag.retriever import retrieve
+from ..kg.multimodal_retriever import format_kg_context, image_to_entities, text_to_kg
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -227,6 +228,82 @@ def _make_hospital_tool(event_queue: Optional[asyncio.Queue] = None) -> Structur
     )
 
 
+# ─── 知识图谱检索工具 ──────────────────────────────────────────────────────────
+
+
+class KGSearchInput(BaseModel):
+    query: str = Field(..., description="用于在医学知识图谱中搜索的查询语句")
+    max_depth: int = Field(default=2, ge=1, le=3, description="关系拓展的最大跳数")
+
+
+def _make_kg_search_tool(event_queue: Optional[asyncio.Queue] = None) -> StructuredTool:
+    async def _kg_search_fn(query: str, max_depth: int = 2) -> str:
+        _push_step(event_queue, "KG_Searching", {"query": query})
+
+        kg_result = await text_to_kg(query, max_depth=max_depth)
+
+        entity_count = len(kg_result.get("entities", []))
+        rel_count = len(kg_result.get("relations", []))
+        _push_step(event_queue, "KG_Done", {
+            "entities": entity_count,
+            "relations": rel_count,
+        })
+
+        context = format_kg_context(kg_result)
+        return json.dumps({
+            "context": context,
+            "entity_count": entity_count,
+            "relation_count": rel_count,
+        }, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        coroutine=_kg_search_fn,
+        name="kg_entity_search",
+        description=(
+            "在医学知识图谱中检索疾病、症状、药物等实体及其关系。"
+            "当需要了解疾病与症状的关联、药物适应症、治疗方案的关系网络时使用此工具。"
+            "返回结构化的实体-关系信息供回答使用。"
+        ),
+        args_schema=KGSearchInput,
+    )
+
+
+# ─── 图片匹配工具 ──────────────────────────────────────────────────────────────
+
+
+class ImageMatchInput(BaseModel):
+    image_path: str = Field(..., description="服务器上医学图片的文件路径")
+    top_k: int = Field(default=3, ge=1, le=10, description="返回最匹配的实体数量")
+
+
+def _make_image_match_tool(event_queue: Optional[asyncio.Queue] = None) -> StructuredTool:
+    async def _image_match_fn(image_path: str, top_k: int = 3) -> str:
+        _push_step(event_queue, "Image_Encoding", {"image_path": image_path})
+
+        result = await image_to_entities(image_path, top_k=top_k)
+
+        matched_count = len(result.get("entities", []))
+        _push_step(event_queue, "Image_Done", {"matched_entities": matched_count})
+
+        context = format_kg_context(result)
+        return json.dumps({
+            "context": context,
+            "matched_entities": [e.get("name") for e in result.get("entities", [])],
+            "matched_images": len(result.get("matched_images", [])),
+        }, ensure_ascii=False)
+
+    return StructuredTool.from_function(
+        coroutine=_image_match_fn,
+        name="image_disease_match",
+        description=(
+            "通过医学图片匹配知识图谱中的疾病实体。"
+            "当用户上传了医学图片（如 X 光、CT、病理切片等）需要辅助诊断时使用此工具。"
+            "基于 CLIP 跨模态对齐找到最相似的疾病实体并返回关联的医学知识。"
+        ),
+        args_schema=ImageMatchInput,
+    )
+
+
 # ─── 对外工厂函数 ──────────────────────────────────────────────────────────────
 
 
@@ -239,4 +316,6 @@ def build_tools(
     return [
         _make_rag_tool(db=db, event_queue=event_queue, doc_ids=doc_ids),
         _make_hospital_tool(event_queue=event_queue),
+        _make_kg_search_tool(event_queue=event_queue),
+        _make_image_match_tool(event_queue=event_queue),
     ]

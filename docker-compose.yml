@@ -88,9 +88,28 @@ services:
       timeout: 20s
       retries: 3
 
+  # ─── Neo4j 图数据库 ────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    container_name: medqa_neo4j
+    environment:
+      NEO4J_AUTH: neo4j/medqa123
+      NEO4J_PLUGINS: '["apoc"]'
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "neo4j", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
 volumes:
   postgres_data:
   redis_data:
   etcd_data:
   minio_data:
   milvus_data:
+  neo4j_data:

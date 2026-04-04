@@ -66,11 +66,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("BM25 load failed (non-fatal): %s", e)
 
+    # 初始化 Neo4j 图数据库 schema
+    try:
+        from .kg.graph_store import init_graph_schema
+        await init_graph_schema()
+        logger.info("Neo4j graph schema ready.")
+    except Exception as e:
+        logger.warning("Neo4j init failed (non-fatal): %s", e)
+
     yield
 
     # ── 应用关闭钩子 ──────────────────────────────────────────────────────────────────
     logger.info("Shutting down MedQA backend…")
     await close_redis()
+
+    # 关闭 Neo4j 驱动
+    try:
+        from .kg.graph_store import close_driver
+        await close_driver()
+    except Exception:
+        pass
 
 
 def create_app() -> FastAPI:

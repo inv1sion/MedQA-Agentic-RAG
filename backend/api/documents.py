@@ -269,3 +269,143 @@ async def delete_document(
 
     await db.delete(doc)
     await db.commit()
+
+
+# ─── 医学图片上传（多模态知识图谱）──────────────────────────────────────────
+
+_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp"}
+
+
+@router.post("/images", status_code=status.HTTP_201_CREATED)
+async def upload_medical_image(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    entity_name: str = "",
+    entity_label: str = "Disease",
+    current_user: User = Depends(get_current_user),
+):
+    """
+    上传医学图片并关联到知识图谱实体。
+
+    流程：CLIP 编码 → 创建 Image 节点 → DEPICTS 关系连接到实体。
+    """
+    content_type = file.content_type or ""
+    if content_type not in _IMAGE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"不支持的图片类型: {content_type}，支持 JPEG/PNG/WebP/BMP",
+        )
+
+    content = await file.read()
+    size_mb = len(content) / (1024 * 1024)
+    if size_mb > settings.MAX_UPLOAD_SIZE_MB:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"文件过大（最大 {settings.MAX_UPLOAD_SIZE_MB} MB）",
+        )
+
+    import os
+    from pathlib import Path
+
+    upload_dir = Path(settings.IMAGE_UPLOAD_DIR)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    image_id = str(uuid.uuid4())
+    ext = Path(file.filename or "image.jpg").suffix or ".jpg"
+    file_path = upload_dir / f"{image_id}{ext}"
+    file_path.write_bytes(content)
+
+    background_tasks.add_task(
+        _process_image, image_id, str(file_path), entity_name, entity_label
+    )
+
+    return {
+        "image_id": image_id,
+        "file_path": str(file_path),
+        "status": "processing",
+        "entity_name": entity_name or None,
+    }
+
+
+async def _process_image(
+    image_id: str,
+    file_path: str,
+    entity_name: str,
+    entity_label: str,
+) -> None:
+    """后台任务：CLIP 编码 → 写入 Neo4j Image 节点 → 关联实体。"""
+    try:
+        from ..kg.image_encoder import encode_image
+        from ..kg.graph_store import upsert_image_node, link_image_to_entity
+
+        clip_vec = encode_image(file_path)
+
+        await upsert_image_node(
+            image_id=image_id,
+            file_path=file_path,
+            clip_embedding=clip_vec,
+            metadata={"original_entity": entity_name},
+        )
+
+        if entity_name:
+            await link_image_to_entity(
+                image_id=image_id,
+                entity_label=entity_label,
+                entity_name=entity_name,
+            )
+
+        logger.info("Image %s processed and linked to %s:%s", image_id, entity_label, entity_name)
+    except Exception:
+        logger.exception("Image processing failed: %s", image_id)
+
+
+# ─── 文档知识图谱抽取 ─────────────────────────────────────────────────────────
+
+
+@router.post("/{doc_id}/extract-kg", status_code=status.HTTP_202_ACCEPTED)
+async def extract_document_kg(
+    doc_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """对已上传的文档执行知识图谱实体关系抽取。"""
+    result = await db.execute(
+        select(Document).where(
+            Document.id == doc_id,
+            Document.user_id == current_user.id,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if doc.status != "ready":
+        raise HTTPException(status_code=400, detail="文档尚未处理完成")
+
+    background_tasks.add_task(_extract_kg_from_doc, doc_id)
+    return {"doc_id": doc_id, "status": "kg_extracting"}
+
+
+async def _extract_kg_from_doc(doc_id: str) -> None:
+    """后台任务：从文档分块中抽取知识图谱三元组。"""
+    try:
+        from ..kg.entity_extractor import extract_and_persist
+        from ..kg.graph_store import init_graph_schema
+
+        await init_graph_schema()
+
+        async with AsyncSessionFactory() as db:
+            result = await db.execute(
+                select(ParentChunk)
+                .where(ParentChunk.doc_id == doc_id, ParentChunk.level == 1)
+                .order_by(ParentChunk.chunk_index)
+            )
+            chunks = list(result.scalars().all())
+
+            for chunk in chunks:
+                if chunk.content and len(chunk.content.strip()) > 50:
+                    await extract_and_persist(chunk.content, doc_id=doc_id)
+
+        logger.info("KG extraction complete for doc %s (%d chunks)", doc_id, len(chunks))
+    except Exception:
+        logger.exception("KG extraction failed for doc %s", doc_id)

@@ -1,10 +1,18 @@
-"""MedQA 的 LangChain OpenAI-tools Agent。
+"""MedQA 的 LangGraph ReAct Agent。
 
 流式架构
 --------
-Agent 通过 `agent_executor.astream(stream_mode="messages")` 调用。
-每次 yield 的 chunk 可能是 AIMessageChunk（token）或带工具调用的 ToolMessage/AIMessage。
-两种情况都会被拦截并推送为 SSE 事件。
+Agent 通过 LangGraph 的 `create_react_agent` 构建有状态图，
+并使用 `astream_events(version="v2")` 进行流式推送。
+拦截 `on_chat_model_stream`、`on_tool_start`、`on_tool_end` 等事件
+并转换为 SSE 事件推送给前端。
+
+持久化记忆
+----------
+通过 LangGraph PostgresSaver checkpointer 将图执行状态持久化到 PostgreSQL。
+每个会话的 `session_id` 作为 `thread_id`，图自动累积多轮对话消息，
+新请求仅需传入当次用户消息。`state_modifier` 可调用对象负责注入系统提示
+并截断过长历史以控制 token 预算。
 
 实时工具步骤可见性
 ------------------
@@ -20,9 +28,10 @@ import json
 import logging
 from typing import AsyncGenerator, Optional
 
-from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.prebuilt import create_react_agent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -31,14 +40,31 @@ from .tools import build_tools
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+# ── Checkpointer 单例（懒加载）──────────────────────────────────────
+_checkpointer: Optional[AsyncPostgresSaver] = None
+
+
+async def _get_checkpointer() -> AsyncPostgresSaver:
+    global _checkpointer
+    if _checkpointer is None:
+        _checkpointer = AsyncPostgresSaver.from_conn_string(
+            settings.CHECKPOINT_DB_URI,
+        )
+        await _checkpointer.setup()
+    return _checkpointer
+
 _SYSTEM_PROMPT = """你是 MedQA，一位专业的中文医疗问答助手。你具备以下能力：
 
 1. **医学知识检索**：通过知识库工具检索权威医学文献，为用户提供准确的医疗信息。
-2. **医院查询**：帮助用户查找推荐医院和科室信息。
-3. **专业建议**：基于检索到的医学文献提供专业、客观的医疗建议。
+2. **知识图谱推理**：从医学知识图谱中检索疾病、症状、药物等实体的关系网络，辅助推理诊断。
+3. **医学图片匹配**：当用户提供医学图片时，通过跨模态匹配找到相关疾病实体。
+4. **医院查询**：帮助用户查找推荐医院和科室信息。
+5. **专业建议**：基于检索到的医学文献和知识图谱提供专业、客观的医疗建议。
 
 **重要原则**：
 - 回答医疗问题前，优先使用 medqa_rag_search 工具检索相关医学知识。
+- 涉及疾病-症状-药物关系时，可同时使用 kg_entity_search 工具从知识图谱获取结构化关系。
+- 若用户提供了医学图片路径，使用 image_disease_match 工具进行跨模态匹配。
 - 若 medqa_rag_search 返回「知识库中未找到相关内容」，**立即停止重试**，直接基于你的医学训练知识给出专业回答，并注明「以下基于通用医学知识」。
 - 同一问题**最多调用 medqa_rag_search 一次**，禁止重复调用。
 - 不凭空编造具体数据或药品剂量，对数字类信息需注明仅供参考。
@@ -60,25 +86,22 @@ def _get_llm() -> ChatOpenAI:
     )
 
 
-def _build_agent(tools: list):
+def _build_graph(tools: list, system_prompt: str, checkpointer: AsyncPostgresSaver):
+    """构建 LangGraph ReAct Agent 图（带持久化 checkpointer）。"""
     llm = _get_llm()
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", "{system_prompt}"),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-            MessagesPlaceholder("agent_scratchpad"),
-        ]
-    )
-    agent = create_openai_tools_agent(llm, tools, prompt)
-    return AgentExecutor(
-        agent=agent,
-        tools=tools,
-        max_iterations=3,
-        early_stopping_method="generate",
-        handle_parsing_errors=True,
-        verbose=False,
-        return_intermediate_steps=True,
+
+    def _state_modifier(state: dict) -> list:
+        """注入系统提示并截断过长的历史消息以控制 token 预算。"""
+        messages = state["messages"]
+        if len(messages) > 20:
+            messages = messages[-20:]
+        return [SystemMessage(content=system_prompt)] + messages
+
+    return create_react_agent(
+        llm,
+        tools,
+        state_modifier=_state_modifier,
+        checkpointer=checkpointer,
     )
 
 
@@ -86,6 +109,7 @@ async def stream_agent(
     query: str,
     chat_history: list,
     db: AsyncSession,
+    session_id: Optional[str] = None,
     session_summary: Optional[str] = None,
     doc_ids: Optional[list[str]] = None,
     top_k: int = 5,
@@ -107,20 +131,30 @@ async def stream_agent(
     event_queue: asyncio.Queue = asyncio.Queue()
     all_sources: list = []
 
-    # 将工具注入 db/queue/doc_ids 的上下文并构建 agent
+    # 将工具注入 db/queue/doc_ids 的上下文并构建 LangGraph 图
     tools = build_tools(db=db, event_queue=event_queue, doc_ids=doc_ids)
-    agent_executor = _build_agent(tools)
 
     summary_section = (
         f"【当前对话摘要】\n{session_summary}" if session_summary else ""
     )
     system_prompt = _SYSTEM_PROMPT.format(summary_section=summary_section)
 
-    agent_input = {
-        "input": query,
-        "chat_history": chat_history,
-        "system_prompt": system_prompt,
-    }
+    checkpointer = await _get_checkpointer()
+    graph = _build_graph(tools, system_prompt, checkpointer)
+
+    # 根据是否已有 checkpoint 决定输入：
+    #   - 已有 checkpoint → 仅传新消息（图状态自动累积历史）
+    #   - 无 checkpoint → 用现有 chat_history 播种
+    run_config: dict = {"run_name": "medqa_agent", "recursion_limit": 10}
+    if session_id:
+        run_config["configurable"] = {"thread_id": session_id}
+        state = await graph.aget_state(run_config)
+        if state and state.values:
+            input_messages = [HumanMessage(content=query)]
+        else:
+            input_messages = list(chat_history) + [HumanMessage(content=query)]
+    else:
+        input_messages = list(chat_history) + [HumanMessage(content=query)]
 
     # ── 后台队列消费协程 ──────────────────────────────────────────────────────────
     # 队列消费协程与 agent 流并发运行。
@@ -140,48 +174,46 @@ async def stream_agent(
     async def _stream_agent_events() -> AsyncGenerator[dict, None]:
         nonlocal final_answer, all_sources
         try:
-            async for chunk in agent_executor.astream(
-                agent_input,
-                config={"run_name": "medqa_agent"},
+            async for event in graph.astream_events(
+                {"messages": input_messages},
+                version="v2",
+                config=run_config,
             ):
+                kind = event["event"]
+
                 # token 逐字输出
-                if "messages" in chunk:
-                    for msg in chunk["messages"]:
-                        content = getattr(msg, "content", "")
-                        if content and hasattr(msg, "type") and msg.type == "ai":
-                            final_answer += content
-                            yield {"type": "token", "content": content}
+                if kind == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    if isinstance(chunk, AIMessageChunk) and chunk.content:
+                        final_answer += chunk.content
+                        yield {"type": "token", "content": chunk.content}
 
-                # 工具调用开始/결束与中间步骤
-                if "actions" in chunk:
-                    for action in chunk["actions"]:
-                        tool_name = getattr(action, "tool", "unknown")
-                        yield {"type": "tool_start", "content": tool_name}
+                # 工具调用开始
+                elif kind == "on_tool_start":
+                    tool_name = event.get("name", "unknown")
+                    yield {"type": "tool_start", "content": tool_name}
 
-                if "steps" in chunk:
-                    for step in chunk["steps"]:
-                        tool_name = getattr(step.action, "tool", "unknown")
-                        tool_out = step.observation or ""
+                # 工具调用结束
+                elif kind == "on_tool_end":
+                    tool_name = event.get("name", "unknown")
+                    tool_output = event["data"].get("output", "")
 
-                        # 尝试从 RAG 工具输出中提取来源信息
-                        if tool_name == "medqa_rag_search":
-                            try:
-                                parsed = json.loads(tool_out)
-                                if "trace" in parsed:
-                                    srcs = parsed["trace"].get("sources", [])
-                                    if srcs:
-                                        all_sources.extend(srcs)
-                            except Exception:
-                                pass
+                    # 尝试从 RAG 工具输出中提取来源信息
+                    if tool_name == "medqa_rag_search":
+                        try:
+                            parsed = (
+                                json.loads(tool_output)
+                                if isinstance(tool_output, str)
+                                else tool_output
+                            )
+                            if isinstance(parsed, dict) and "trace" in parsed:
+                                srcs = parsed["trace"].get("sources", [])
+                                if srcs:
+                                    all_sources.extend(srcs)
+                        except Exception:
+                            pass
 
-                        yield {"type": "tool_end", "content": tool_name}
-
-                # 最终输出
-                if "output" in chunk:
-                    output = chunk["output"]
-                    if output and not final_answer:
-                        final_answer = output
-                        yield {"type": "token", "content": output}
+                    yield {"type": "tool_end", "content": tool_name}
 
         except asyncio.CancelledError:
             yield {"type": "error", "content": "生成已被用户中止"}

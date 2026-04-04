@@ -71,10 +71,23 @@ class Settings(BaseSettings):
     # ─── 应用全局配置 ────────────────────────────────────────────────────────
     ALLOWED_ORIGINS: str = "http://localhost:8000,http://127.0.0.1:8000"
     MAX_UPLOAD_SIZE_MB: int = 50
+    # ─── Neo4j 图数据库配置 ───────────────────────────────────────────────
+    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_USER: str = "neo4j"
+    NEO4J_PASSWORD: str = "medqa123"
 
+    # ─── CLIP 多模态配置 ────────────────────────────────────────────────
+    CLIP_MODEL_NAME: str = "OFA-Sys/chinese-clip-vit-base-patch16"
+    CLIP_DEVICE: str = "cpu"
+    IMAGE_UPLOAD_DIR: str = "./uploads/images"
     @property
     def allowed_origins_list(self) -> List[str]:
         return [o.strip() for o in self.ALLOWED_ORIGINS.split(",")]
+
+    @property
+    def CHECKPOINT_DB_URI(self) -> str:
+        """将 asyncpg 连接串转换为 psycopg 格式，供 LangGraph checkpointer 使用。"""
+        return self.POSTGRES_URL.replace("+asyncpg", "")
 
 
 @lru_cache()
