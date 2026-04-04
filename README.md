@@ -1,6 +1,6 @@
-# MEDQA — 中文医疗问答 Agentic RAG 系统
+# MEDQA — 基于 Agentic GraphRAG 的中文医疗多模态知识问答系统
 
-基于 LangChain Agent + Milvus 混合检索 + FastAPI 的中文医疗知识库问答平台。
+基于 LangGraph Agent + Milvus 混合检索 + Neo4j 知识图谱 + Chinese-CLIP 跨模态匹配 + FastAPI 的中文医疗问答平台。
 
 ---
 
@@ -15,9 +15,10 @@
 7. [文档处理链路](#文档处理链路)
 8. [三级分块与 Auto-merging](#三级分块与-auto-merging)
 9. [混合检索与重排序](#混合检索与重排序)
-10. [会话记忆机制](#会话记忆机制)
-11. [RAG 评估体系](#rag-评估体系)
-12. [常见问题](#常见问题)
+10. [知识图谱与多模态](#知识图谱与多模态)
+11. [会话记忆机制](#会话记忆机制)
+12. [RAG 评估体系](#rag-评估体系)
+13. [常见问题](#常见问题)
 
 ---
 
@@ -29,21 +30,29 @@
     ▼
 FastAPI 后端
     ├── JWT 鉴权 + RBAC (admin/user)
-    ├── LangChain Agent (工具调用)
-    │       ├── medqa_rag_search  ← 核心知识库检索工具
-    │       └── hospital_query   ← 医院信息查询示例工具
+    ├── LangGraph ReAct Agent (自主工具编排)
+    │       ├── medqa_rag_search      ← 核心知识库检索工具
+    │       ├── kg_entity_search      ← 知识图谱实体关系检索
+    │       ├── image_disease_match   ← CLIP 跨模态图片匹配
+    │       └── hospital_query        ← 医院信息查询
     ├── RAG 流水线
     │       ├── 查询重写 (Step-Back / HyDE)
     │       ├── Milvus 混合检索 (Dense + BM25 / RRF)
     │       ├── Auto-merging (L3→L2→L1)
     │       ├── 相关性评分门控
     │       └── Qwen3 Rerank 精排
+    ├── 知识图谱层
+    │       ├── LLM 自动抽取三元组 → Neo4j
+    │       ├── 全文搜索 + BFS 多跳关系推理
+    │       └── Chinese-CLIP 跨模态图像检索
+    ├── PostgresSaver Checkpointer (多轮对话状态持久化)
     └── asyncio.Queue 实时步骤推送
-         (Searching → Grading → Rewriting)
+         (Searching → KG_Searching → Image_Encoding → Grading → Rewriting)
 
 存储层
-    ├── PostgreSQL  — 用户、文档元数据、父块、会话、消息
+    ├── PostgreSQL  — 用户、文档元数据、父块、会话、消息、Checkpoint
     ├── Milvus      — L3 叶子块稠密/稀疏向量
+    ├── Neo4j       — 医学知识图谱 (实体 + 关系 + 图片节点)
     └── Redis       — 热点会话缓存、父文档缓存
 ```
 
@@ -56,8 +65,7 @@ FastAPI 后端
 | Python | 3.10 ~ 3.12 |
 | Docker & Docker Compose | 20.10+ |
 | WSL2 (Windows 用户) | Ubuntu 20.04+ |
-| 阿里云 DashScope API Key | 用于 LLM / Embedding / Rerank |
-
+| 阿里云 DashScope API Key | 用于 LLM / Embedding / Rerank || GPU (可选) | CLIP 模型推理加速，CPU 亦可运行 |
 ---
 
 ## 快速启动
@@ -73,7 +81,7 @@ docker compose up -d
 
 ```bash
 docker compose ps
-# postgres、redis、milvus 均显示 healthy 即可
+# postgres、redis、milvus、neo4j 均显示 healthy 即可
 ```
 
 ### 第二步：配置环境变量
@@ -154,7 +162,7 @@ EMBEDDING_API_KEY=sk-xxxxxxxxxxxxxxxx
 EMBEDDING_MODEL=text-embedding-v3
 EMBEDDING_DIM=1024
 
-# ── 重排序模型（Qwen3 Rerank / GTE-Rerank）──────────────────────────────────
+# ── 重排序模型（Qwen3 Rerank）──────────────────────────────────
 RERANK_API_KEY=sk-xxxxxxxxxxxxxxxx
 RERANK_MODEL=gte-rerank
 RERANK_BASE_URL=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
@@ -196,6 +204,16 @@ MERGE_THRESHOLD=0.5            # Auto-merging 合并触发比例
 # ── 会话摘要 ─────────────────────────────────────────────────────────────────
 SUMMARY_THRESHOLD=20           # 超过 20 条消息触发摘要
 SUMMARY_WINDOW=10              # 每次摘要最近 10 条
+
+# ── Neo4j 知识图谱 ──────────────────────────────────────────────────────────
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=medqa123
+
+# ── CLIP 多模态 ──────────────────────────────────────────────────────────────
+CLIP_MODEL_NAME=OFA-Sys/chinese-clip-vit-base-patch16
+CLIP_DEVICE=cpu                # 有 GPU 可改为 cuda
+IMAGE_UPLOAD_DIR=./uploads/images
 
 # ── 应用全局 ─────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
@@ -240,6 +258,8 @@ MAX_UPLOAD_SIZE_MB=50
 | POST | `/api/documents/upload` | 上传文档（PDF/DOCX/TXT） | 登录用户 |
 | GET  | `/api/documents/` | 获取文档列表 | 登录用户 |
 | DELETE | `/api/documents/{id}` | 删除文档及其所有向量 | Admin |
+| POST | `/api/documents/images` | 上传医学图片（CLIP 编码入图谱） | 登录用户 |
+| POST | `/api/documents/{id}/extract-kg` | 触发文档知识图谱抽取 | 登录用户 |
 
 上传文档（multipart/form-data）：
 ```bash
@@ -402,9 +422,49 @@ Top-K 结果传入 Agent 生成回答
 
 ---
 
+## 知识图谱与多模态
+
+### 知识图谱构建
+
+```
+文档上传 → POST /{doc_id}/extract-kg
+    │
+    ▼
+LLM Structured Output 抽取
+    ├── 实体：Disease / Symptom / Drug / BodyPart / Procedure
+    └── 关系：HAS_SYMPTOM / TREATED_BY / AFFECTS / DIAGNOSED_BY / CONTRAINDICATED_WITH / CAUSES
+    │
+    ▼
+Neo4j MERGE 写入（幂等，支持增量更新）
+```
+
+### 跨模态图像匹配
+
+```
+医学图片上传 → POST /api/documents/images
+    │
+    ▼
+Chinese-CLIP 编码 → 512 维归一化向量
+    │
+    ▼
+Neo4j Image 节点 ──DEPICTS──→ Disease 实体
+    │
+    ▼
+Agent 调用 image_disease_match 工具
+    → CLIP 相似度排序 → 匹配疾病 → 拓展关系子图
+```
+
+### Agent 多源融合
+
+Agent 自主决策组合调用工具，实现文本 RAG（文献证据） + 图谱推理（结构化关系） + 图像匹配（跨模态）的三路融合回答。
+
+---
+
 ## 会话记忆机制
 
-- 每条用户消息和 AI 回答都持久化到 PostgreSQL
+- LangGraph PostgresSaver Checkpointer 将 Agent 图执行状态按 `thread_id`（= `session_id`）持久化，新请求自动恢复历史
+- `state_modifier` 截断历史消息至最近 20 条，控制 token 预算
+- 每条用户消息和 AI 回答同时持久化到 PostgreSQL 业务表
 - Redis 缓存最近会话的消息列表（TTL 1 小时）
 - 当会话消息总数超过 `SUMMARY_THRESHOLD`（默认 20 条）时，自动对最早的 `SUMMARY_WINDOW` 条消息做 LLM 摘要，注入系统提示，防止 token 膨胀
 
@@ -468,3 +528,12 @@ Top-K 结果传入 Agent 生成回答
 > proxy_buffering off;
 > X-Accel-Buffering: no;
 > ```
+
+**Q：Neo4j 启动失败？**
+> 确认 Docker 中 Neo4j 容器正常运行：`docker compose logs neo4j`。首次启动需要约 15 秒初始化。
+
+**Q：CLIP 模型下载慢？**
+> Chinese-CLIP 模型约 600 MB，首次使用时自动从 HuggingFace 下载。可设置 `HF_ENDPOINT=https://hf-mirror.com` 使用国内镜像。
+
+**Q：图片上传后如何关联到图谱实体？**
+> 上传时通过 `entity_name` 和 `entity_label` 参数指定关联的实体，如 `entity_name=肺炎&entity_label=Disease`。
